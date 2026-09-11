@@ -1,0 +1,80 @@
+# Single replica local DataPlane, connected to Konnect via the KonnectExtension above.
+# Per https://developer.konghq.com/operator/get-started/konnect-crds/controlplane/
+# ("Deploy a Dataplane"). The proxy/ingress Service defaults to type
+# LoadBalancer - MetalLB (installed via task metallb:install) assigns it an IP
+# from the kind Docker network range.
+#
+# Must be a Kong Gateway Enterprise image (not OSS kong:x.y) - Konnect rejects
+# OSS data plane nodes as COMPATIBILITY_STATE_INCOMPATIBLE and never syncs config.
+#
+# ── env var ownership ────────────────────────────────────────────────────────
+# KGO-managed (do NOT set here — KGO overwrites or derives these from KonnectExtension):
+#   KONG_ROLE, KONG_DATABASE, KONG_KONNECT_MODE, KONG_INCREMENTAL_SYNC
+#   KONG_CLUSTER_CONTROL_PLANE, KONG_CLUSTER_TELEMETRY_ENDPOINT
+#   KONG_CLUSTER_SERVER_NAME, KONG_CLUSTER_TELEMETRY_SERVER_NAME
+#   KONG_CLUSTER_LISTEN, KONG_CLUSTER_MTLS
+#   KONG_CLUSTER_CERT, KONG_CLUSTER_CERT_KEY          (from KonnectExtension cert secret)
+#   KONG_PORT_MAPS, KONG_STATUS_LISTEN
+#   KONG_VITALS
+#
+# Set explicitly here (Operator-defaulted values we're making explicit, or
+# demo-specific requirements):
+#   KONG_PROXY_LISTEN, KONG_PLUGINS, KONG_LUA_SSL_TRUSTED_CERTIFICATE
+#   KONG_TRACING_INSTRUMENTATIONS / KONG_TRACING_SAMPLING_RATE — required for
+#     the OpenTelemetry plugin (../../deck/kong-otel-<cp>.yaml) to emit spans
+#     at all, regardless of the plugin's own config.
+#
+# No Datadog Autodiscovery scrape annotation here (unlike an earlier version
+# of this file) - all 3 Control Planes in this repo run the OpenTelemetry
+# plugin only, which PUSHES metrics/traces/logs to the Datadog Agent's OTLP
+# receiver (deck/kong-otel-<cp>.yaml's config.metrics block). There is no
+# Prometheus plugin, no :8100/metrics scrape target, and nothing for
+# Autodiscovery to poll in this setup.
+apiVersion: gateway-operator.konghq.com/v1beta1
+kind: DataPlane
+metadata:
+  name: dataplane
+  namespace: __CP_NAMESPACE__
+spec:
+  extensions:
+    - kind: KonnectExtension
+      name: __CONTROL_PLANE_NAME__
+      group: konnect.konghq.com
+  deployment:
+    replicas: 1
+    podTemplateSpec:
+      spec:
+        containers:
+          - name: proxy
+            image: __DP_IMAGE__
+
+            env:
+              # ── Proxy listeners ─────────────────────────────────────────
+              - name: KONG_PROXY_LISTEN
+                value: "0.0.0.0:8000, 0.0.0.0:8443 ssl"
+
+              # ── Plugins ──────────────────────────────────────────────────
+              - name: KONG_PLUGINS
+                value: "bundled"
+
+              # ── TLS trust ────────────────────────────────────────────────
+              - name: KONG_LUA_SSL_TRUSTED_CERTIFICATE
+                value: "system"
+
+              # ── Logging ──────────────────────────────────────────────────
+              - name: KONG_LOG_LEVEL
+                value: "notice"
+              - name: KONG_PROXY_ACCESS_LOG
+                value: "/dev/stdout"
+              - name: KONG_PROXY_ERROR_LOG
+                value: "/dev/stderr"
+
+              # ── Tracing (required for the OpenTelemetry plugin to emit spans) ─
+              - name: KONG_TRACING_INSTRUMENTATIONS
+                value: "all"
+              - name: KONG_TRACING_SAMPLING_RATE
+                value: "1.0"
+
+            readinessProbe:
+              initialDelaySeconds: 1
+              periodSeconds: 1

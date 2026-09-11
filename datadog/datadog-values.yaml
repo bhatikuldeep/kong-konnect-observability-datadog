@@ -1,0 +1,129 @@
+# Datadog Agent — Helm values for the local kind demo.
+#
+# Install:
+#   helm repo add datadog https://helm.datadoghq.com
+#   helm repo update
+#   helm upgrade --install datadog-agent datadog/datadog \
+#     --namespace datadog --create-namespace \
+#     -f datadog/datadog-values.yaml \
+#     --set datadog.apiKey=$DD_API_KEY \
+#     --set datadog.site=$DD_SITE
+#
+# One shared Agent for the whole cluster, serving multiple Konnect Control
+# Planes (each with its own DataPlane) - all running the OpenTelemetry
+# plugin only (see ../deck/kong-cp*.yaml), no Prometheus plugin/scrape
+# path in this setup. Every CP's metrics/traces/logs arrive over the same
+# OTLP receiver below:
+#   http://datadog-agent.datadog.svc.cluster.local:4318/v1/{traces,logs,metrics}
+# That matches the service name + namespace this chart creates by default.
+#
+# No env/team/region in this file's tags - those vary per Control Plane in
+# a shared-Agent, multi-CP setup like this one, so they're set in each CP's
+# decK config (resource_attributes) instead, mirroring that CP's Terraform
+# labels. Confirmed against Datadog's own Unified Service Tagging docs
+# (docs.datadoghq.com/getting_started/tagging/unified_service_tagging/):
+# an Agent-global env tag does NOT override a per-workload env tag - the
+# resulting data carries BOTH simultaneously, corrupting any env-based
+# filtering the moment two CPs differ. Datadog's own guidance restricts
+# cluster-level env defaults to single-environment clusters, which this
+# isn't.
+
+datadog:
+  # site + apiKey injected at install time via --set (not stored here)
+  site: ""
+  apiKey: ""
+
+  # ── OTLP receiver (traces, logs, AND metrics - all three signals) ──────────
+  otlp:
+    receiver:
+      protocols:
+        http:
+          enabled: true
+          endpoint: "0.0.0.0:4318"
+        grpc:
+          enabled: false    # Kong OTel plugin uses HTTP, not gRPC
+    logs:
+      enabled: true         # enable OTLP log ingestion (opt-in)
+
+  # ── Log collection ───────────────────────────────────────────────────────
+  logs:
+    enabled: true
+    containerCollectAll: false
+
+  # ── APM / traces ─────────────────────────────────────────────────────────
+  apm:
+    portEnabled: true
+
+  kubelet:
+    tlsVerify: false    # kind uses a self-signed kubelet cert
+
+  # ── Tags applied to all telemetry ────────────────────────────────────────
+  # Deliberately empty - nothing here is genuinely true of the whole
+  # Agent/cluster once env/team/region vary per Control Plane (see header
+  # comment). kube_cluster_name is already auto-injected by the Agent's own
+  # Kubernetes integration, so there's nothing left to add manually.
+  tags: []
+
+  # ── Cluster name ──────────────────────────────────────────────────────────
+  clusterName: "konnect-observability-demo"
+
+  # ── Disable unused features ───────────────────────────────────────────────
+  orchestratorExplorer:
+    enabled: false
+  kubeStateMetricsCore:
+    enabled: false
+
+agents:
+  # Raw datadog.yaml passthrough - needed for otlp_config.metrics.resource_
+  # attributes_as_tags, which has NO Helm values.yaml equivalent (confirmed:
+  # `helm show values datadog/datadog` has no key anywhere under
+  # datadog.otlp.receiver.metrics - an earlier attempt to set
+  # datadog.otlp.receiver.metrics.resource_attributes_as_tags here silently
+  # no-op'd, since Helm ignores values keys the chart's templates don't
+  # reference, rather than erroring). Without this, Datadog only auto-maps a
+  # fixed set of OTel semantic-convention resource attributes to tags (e.g.
+  # service.name→service - confirmed via
+  # docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/). Our custom
+  # env/team/region keys (deck/kong-otel-cp*.yaml resource_attributes) are
+  # plain, non-semantic-convention names, so without this flag they'd be
+  # silently dropped - live-confirmed against an earlier config that used
+  # the semantic-convention key deployment.environment instead of plain
+  # env: that key showed up as a real tag with 3 distinct values even
+  # without this flag (Datadog auto-maps it), while team did not
+  # (Metrics Explorer "sum by team" returned N/A) until this flag was set.
+  # This raw config key (documented
+  # at docs.datadoghq.com/metrics/open_telemetry/otlp_metric_types/ and
+  # docs.datadoghq.com/agent/guide/agent-configuration-files/) makes the
+  # Agent attach ALL resource attributes as tags, not just the mapped ones.
+  # Cardinality is bounded here (3 CPs × fixed attribute set), so the usual
+  # "don't enable this blindly in prod" caution doesn't bite in this demo.
+  useConfigMap: true
+  customAgentConfig:
+    otlp_config:
+      metrics:
+        resource_attributes_as_tags: true
+
+  # Tolerations for kind single-node cluster (control-plane taint)
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+
+  containers:
+    agent:
+      # kind clusters: kubelet API hostname detection fails → set explicitly.
+      env:
+        - name: DD_HOSTNAME
+          value: "konnect-observability-demo"
+        - name: DD_HOSTNAME_TRUST_USERDEFINED_AS_CANONICAL
+          value: "true"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
+
+clusterAgent:
+  enabled: false    # single-node demo, not needed

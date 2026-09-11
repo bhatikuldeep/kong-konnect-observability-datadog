@@ -1,0 +1,756 @@
+{
+  "title": "Kong Konnect Dashboard",
+  "description": "Kong Gateway metrics, via the Prometheus plugin + Datadog Agent Autodiscovery scrape. Sections: Status at a glance -> Traffic -> Latency -> Errors -> Resource usage -> Logs.",
+  "layout_type": "ordered",
+  "reflow_type": "auto",
+  "notify_list": [],
+  "template_variables": [
+    {
+      "name": "scope",
+      "prefix": "kube_namespace",
+      "available_values": ["kong"],
+      "default": "kong"
+    }
+  ],
+  "widgets": [
+    {
+      "definition": {
+        "type": "image",
+        "url": "/static/images/logos/kong_small.svg",
+        "sizing": "contain",
+        "has_background": false,
+        "has_border": false,
+        "horizontal_align": "left",
+        "vertical_align": "center"
+      }
+    },
+    {
+      "definition": {
+        "title": "Status at a glance",
+        "title_align": "left",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "definition": {
+              "title": "Requests / sec",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "aggregator": "avg",
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_http_requests.count{$scope}.as_rate()"
+                    }
+                  ],
+                  "response_format": "scalar"
+                }
+              ],
+              "autoscale": false,
+              "custom_unit": "req/s",
+              "precision": 3,
+              "text_align": "left"
+            }
+          },
+          {
+            "definition": {
+              "title": "Average total request latency",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1 / query2",
+                      "conditional_formats": [
+                        { "comparator": ">", "value": 500, "palette": "white_on_red" },
+                        { "comparator": "<=", "value": 500, "palette": "white_on_green" }
+                      ]
+                    }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:kong.kong_request_latency_ms.sum{$scope}.as_count()" },
+                    { "data_source": "metrics", "name": "query2", "query": "sum:kong.kong_request_latency_ms.count{$scope}.as_count()" }
+                  ],
+                  "response_format": "scalar"
+                }
+              ],
+              "autoscale": true,
+              "custom_unit": "ms",
+              "precision": 1,
+              "text_align": "left"
+            }
+          },
+          {
+            "definition": {
+              "title": "Errors (4xx + 5xx)",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1 + query2",
+                      "conditional_formats": [
+                        { "comparator": ">", "value": 0, "palette": "white_on_red" },
+                        { "comparator": "<=", "value": 0, "palette": "white_on_green" }
+                      ]
+                    }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:kong.kong_http_requests.count{$scope,code:4*}.as_count()" },
+                    { "data_source": "metrics", "name": "query2", "query": "sum:kong.kong_http_requests.count{$scope,code:5*}.as_count()" }
+                  ],
+                  "response_format": "scalar"
+                }
+              ],
+              "autoscale": true,
+              "precision": 0,
+              "text_align": "left"
+            }
+          },
+          {
+            "definition": {
+              "title": "Control plane connected",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "aggregator": "last",
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:kong.kong_control_plane_connected{$scope}"
+                    }
+                  ],
+                  "response_format": "scalar",
+                  "conditional_formats": [
+                    { "comparator": "<", "value": 1, "palette": "white_on_red" },
+                    { "comparator": ">=", "value": 1, "palette": "white_on_green" }
+                  ]
+                }
+              ],
+              "autoscale": true,
+              "precision": 0,
+              "text_align": "left"
+            }
+          },
+          {
+            "definition": {
+              "title": "Node version",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "toplist",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "aggregator": "last",
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:kong.kong_node_info{$scope} by {version}"
+                    }
+                  ],
+                  "response_format": "scalar"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Traffic",
+        "title_align": "left",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "definition": {
+              "title": "Requests by status code",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": ["avg", "min", "max", "value", "sum"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_http_requests.count{$scope} by {code}.as_count()"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "green", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "bars"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Status code distribution",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "sunburst",
+              "legend": { "type": "table" },
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_http_requests.count{$scope} by {code}.as_count()"
+                    }
+                  ],
+                  "response_format": "scalar"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Traffic by service",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "sunburst",
+              "legend": { "type": "table" },
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_request_latency_ms.count{$scope} by {service}.as_count()"
+                    }
+                  ],
+                  "response_format": "scalar"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Top 10 services by request volume",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "toplist",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1", "limit": { "count": 10, "order": "desc" } }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_request_latency_ms.count{$scope} by {service}.as_count()"
+                    }
+                  ],
+                  "response_format": "scalar"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Error rate: 4xx + 5xx as % of total",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "(query2 + query3) / query1 * 100",
+                      "conditional_formats": [
+                        { "comparator": ">", "value": 5, "palette": "white_on_red" },
+                        { "comparator": "<=", "value": 5, "palette": "white_on_green" }
+                      ]
+                    }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:kong.kong_http_requests.count{$scope}.as_count()" },
+                    { "data_source": "metrics", "name": "query2", "query": "sum:kong.kong_http_requests.count{$scope,code:4*}.as_count()" },
+                    { "data_source": "metrics", "name": "query3", "query": "sum:kong.kong_http_requests.count{$scope,code:5*}.as_count()" }
+                  ],
+                  "response_format": "scalar"
+                }
+              ],
+              "autoscale": true,
+              "custom_unit": "%",
+              "precision": 1
+            }
+          },
+          {
+            "definition": {
+              "title": "Upstream target health",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "aggregator": "last",
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:kong.kong_upstream_target_health{$scope,state:healthy}"
+                    }
+                  ],
+                  "response_format": "scalar",
+                  "conditional_formats": [
+                    { "comparator": "<", "value": 1, "palette": "white_on_red" },
+                    { "comparator": ">=", "value": 1, "palette": "white_on_green" }
+                  ]
+                }
+              ],
+              "autoscale": true,
+              "precision": 0
+            }
+          },
+          {
+            "definition": {
+              "title": "Bandwidth (ingress/egress)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": ["avg", "min", "max", "value", "sum"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_bandwidth_bytes.count{$scope} by {direction}.as_count()"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "cool", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "bars"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Nginx connections by state",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": ["avg", "min", "max", "value"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:kong.kong_nginx_connections_total{!state:total,$scope} by {state}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "cool", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "line"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Latency",
+        "title_align": "left",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "definition": {
+              "title": "Average latency by phase (ms)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": ["min", "max", "avg", "value"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    { "formula": "query1 / query2", "alias": "Kong (routing + plugins)" },
+                    { "formula": "query3 / query4", "alias": "Upstream" },
+                    { "formula": "query5 / query6", "alias": "Total request" }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:kong.kong_kong_latency_ms.sum{$scope}.as_count()" },
+                    { "data_source": "metrics", "name": "query2", "query": "sum:kong.kong_kong_latency_ms.count{$scope}.as_count()" },
+                    { "data_source": "metrics", "name": "query3", "query": "sum:kong.kong_upstream_latency_ms.sum{$scope}.as_count()" },
+                    { "data_source": "metrics", "name": "query4", "query": "sum:kong.kong_upstream_latency_ms.count{$scope}.as_count()" },
+                    { "data_source": "metrics", "name": "query5", "query": "sum:kong.kong_request_latency_ms.sum{$scope}.as_count()" },
+                    { "data_source": "metrics", "name": "query6", "query": "sum:kong.kong_request_latency_ms.count{$scope}.as_count()" }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "green", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": { "include_zero": true, "label": "ms", "scale": "linear", "min": "auto", "max": "auto" },
+              "markers": []
+            }
+          },
+          {
+            "definition": {
+              "title": "Request volume by service",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": ["min", "max", "avg", "value"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_request_latency_ms.count{$scope} by {service}.as_count()"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "green", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "bars"
+                }
+              ],
+              "yaxis": { "include_zero": true, "label": "", "scale": "linear", "min": "auto", "max": "auto" },
+              "markers": []
+            }
+          },
+          {
+            "definition": {
+              "title": "Top 10 slowest services (avg total latency)",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "toplist",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1 / query2",
+                      "limit": { "count": 10, "order": "desc" }
+                    }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:kong.kong_request_latency_ms.sum{$scope} by {service}.as_count()" },
+                    { "data_source": "metrics", "name": "query2", "query": "sum:kong.kong_request_latency_ms.count{$scope} by {service}.as_count()" }
+                  ],
+                  "response_format": "scalar"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Errors",
+        "title_align": "left",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "definition": {
+              "title": "Nginx metric errors (Prometheus plugin export health)",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "aggregator": "sum",
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:kong.kong_nginx_metric_errors.count{$scope}.as_count()"
+                    }
+                  ],
+                  "response_format": "scalar",
+                  "conditional_formats": [
+                    { "comparator": ">", "value": 0, "palette": "white_on_red" },
+                    { "comparator": "<=", "value": 0, "palette": "white_on_green" }
+                  ]
+                }
+              ],
+              "autoscale": true,
+              "precision": 0
+            }
+          },
+          {
+            "definition": {
+              "title": "4xx / 5xx requests over time",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": ["avg", "min", "max", "value", "sum"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    { "formula": "query1", "alias": "4xx" },
+                    { "formula": "query2", "alias": "5xx" }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:kong.kong_http_requests.count{$scope,code:4*}.as_count()" },
+                    { "data_source": "metrics", "name": "query2", "query": "sum:kong.kong_http_requests.count{$scope,code:5*}.as_count()" }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "warm", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "bars"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Error Logs",
+              "title_size": "16",
+              "title_align": "left",
+              "requests": [
+                {
+                  "response_format": "event_list",
+                  "query": {
+                    "data_source": "logs_stream",
+                    "query_string": "status:error",
+                    "indexes": [],
+                    "storage": "hot",
+                    "sort": { "order": "desc", "column": "timestamp" }
+                  },
+                  "columns": [
+                    { "field": "status_line", "width": "auto" },
+                    { "field": "timestamp", "width": "auto" },
+                    { "field": "host", "width": "auto" },
+                    { "field": "service", "width": "auto" },
+                    { "field": "content", "width": "compact" }
+                  ]
+                }
+              ],
+              "type": "list_stream"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Resource usage",
+        "title_align": "left",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "definition": {
+              "title": "Container CPU usage",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": ["avg", "min", "max", "value", "sum"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1", "alias": "Usage" }],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:container.cpu.usage{$scope,container_name:proxy}" }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "cool", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "line"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Lua VM memory (worker)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": ["avg", "min", "max", "value", "sum"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:kong.kong_memory_workers_lua_vms_bytes{$scope} by {pid}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "blue", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "bars"
+                }
+              ]
+            }
+          },
+          {
+            "definition": {
+              "title": "Shared dict usage % by dict (top 10 fullest)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": ["min", "max", "avg", "value"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1 / query2 * 100",
+                      "limit": { "count": 10, "order": "desc" }
+                    }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "avg:kong.kong_memory_lua_shared_dict_bytes{$scope} by {shared_dict}" },
+                    { "data_source": "metrics", "name": "query2", "query": "avg:kong.kong_memory_lua_shared_dict_total_bytes{$scope} by {shared_dict}" }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "blue", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": { "include_zero": true, "label": "", "scale": "linear", "min": "auto", "max": "auto" },
+              "markers": []
+            }
+          },
+          {
+            "definition": {
+              "title": "Shared dict usage as % of capacity",
+              "title_size": "16",
+              "title_align": "left",
+              "type": "query_value",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1 / query2 * 100",
+                      "conditional_formats": [
+                        { "comparator": ">", "value": 90, "palette": "white_on_red" },
+                        { "comparator": "<=", "value": 90, "palette": "white_on_green" }
+                      ]
+                    }
+                  ],
+                  "queries": [
+                    { "data_source": "metrics", "name": "query1", "query": "sum:kong.kong_memory_lua_shared_dict_bytes{$scope}" },
+                    { "data_source": "metrics", "name": "query2", "query": "sum:kong.kong_memory_lua_shared_dict_total_bytes{$scope}" }
+                  ],
+                  "response_format": "scalar"
+                }
+              ],
+              "autoscale": true,
+              "custom_unit": "%",
+              "precision": 1
+            }
+          },
+          {
+            "definition": {
+              "title": "Nginx timers (running vs pending)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": ["avg", "min", "max", "value", "sum"],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [{ "formula": "query1" }],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "avg:kong.kong_nginx_timers{$scope} by {state}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": { "palette": "orange", "line_type": "solid", "line_width": "normal" },
+                  "display_type": "line"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "title": "Logs",
+        "title_align": "left",
+        "show_title": true,
+        "type": "group",
+        "layout_type": "ordered",
+        "widgets": [
+          {
+            "definition": {
+              "title": "All logs",
+              "title_size": "16",
+              "title_align": "left",
+              "requests": [
+                {
+                  "response_format": "event_list",
+                  "query": {
+                    "data_source": "logs_stream",
+                    "query_string": "",
+                    "indexes": [],
+                    "storage": "hot",
+                    "sort": { "order": "desc", "column": "timestamp" }
+                  },
+                  "columns": [
+                    { "field": "status_line", "width": "auto" },
+                    { "field": "timestamp", "width": "auto" },
+                    { "field": "host", "width": "auto" },
+                    { "field": "service", "width": "auto" },
+                    { "field": "content", "width": "compact" }
+                  ]
+                }
+              ],
+              "type": "list_stream"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

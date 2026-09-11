@@ -1,0 +1,79 @@
+# Declarative config for Control Plane 2 (cp2) - synced via `task deck:sync:cp2`.
+# See kong-otel-cp1.yaml's header for the full explanation shared across
+# all 3 CP configs - this file only differs in names and
+# resource_attributes (env/team/region).
+_format_version: "3.0"
+
+services:
+  - name: kong-sample-service-cp2
+    host: kong-sample-upstream-cp2
+    port: 443
+    protocol: https
+    path: /anything
+    routes:
+      - name: kong-sample-route-cp2
+        paths:
+          - /sample
+        strip_path: true
+
+  - name: kong-protected-service-cp2
+    host: kong-sample-upstream-cp2
+    port: 443
+    protocol: https
+    path: /anything
+    routes:
+      - name: kong-protected-route-cp2
+        paths:
+          - /protected
+        strip_path: true
+
+upstreams:
+  - name: kong-sample-upstream-cp2
+    healthchecks:
+      active:
+        type: https
+        http_path: /anything
+        healthy:
+          interval: 5
+          successes: 1
+        unhealthy:
+          interval: 5
+          http_failures: 2
+    targets:
+      - target: httpbin.konghq.com:443
+
+consumers:
+  - username: cp2-sample-consumer
+    keyauth_credentials:
+      - key: cp2-sample-api-key
+
+plugins:
+  - name: key-auth
+    service: kong-protected-service-cp2
+    config:
+      key_names:
+        - apikey
+
+  - name: opentelemetry
+    config:
+      traces_endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/traces
+      access_logs:
+        endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/logs
+      metrics:
+        endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/metrics
+        push_interval: 10
+        enable_request_metrics: true
+        enable_latency_metrics: true
+        enable_bandwidth_metrics: true
+        enable_upstream_health_metrics: true
+        enable_consumer_attribute: true
+      # Mirrors this CP's Terraform labels (terraform/variables.tf,
+      # control_planes.cp2).
+      resource_attributes:
+        service.name: konnect-observability-demo-cp2
+        env: staging
+        team: payments
+        region: eu-west-1
+      sampling_rate: 1.0
+      batch_span_count: 200
+      batch_flush_delay: 3

@@ -1,0 +1,32 @@
+# Mirrors the Konnect control plane created by Terraform (../terraform/) into this
+# cluster so Kong Operator can reference it. spec.source: Mirror means the
+# operator will NOT create a new CP in Konnect - it just points at the existing
+# one by ID. The CP lifecycle stays with Terraform - deleting this CRD from
+# the cluster has no effect on the Konnect CP.
+#
+# NOTE: spec.source and spec.mirror are TOP-LEVEL fields on this resource in
+# the installed CRD version (Kong Operator 2.3, konnect.konghq.com/v1alpha2)
+# - NOT nested under spec.konnect. Kong's own "Get started with Kong Operator
+# and Konnect CRDs" doc series shows them nested under spec.konnect, which
+# this installed version rejects with a strict-decoding error ("unknown field
+# spec.konnect.mirror/source") - confirmed live via `kubectl explain
+# konnectgatewaycontrolplane.spec --api-version=konnect.konghq.com/v1alpha2`.
+# Likely a doc/CRD version mismatch; this shape is what's actually installed.
+#
+# createControlPlaneRequest must NOT be set for Mirror mode - confirmed live
+# ("createControlPlaneRequest fields cannot be set for type Mirror"), despite
+# Kong's own doc example showing both together. Omitted here; the CP identity
+# comes entirely from mirror.konnect.id.
+apiVersion: konnect.konghq.com/v1alpha2
+kind: KonnectGatewayControlPlane
+metadata:
+  name: __CONTROL_PLANE_NAME__
+  namespace: __CP_NAMESPACE__
+spec:
+  konnect:
+    authRef:
+      name: konnect-api-auth
+  source: Mirror
+  mirror:
+    konnect:
+      id: __CONTROL_PLANE_ID__

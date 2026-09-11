@@ -1,0 +1,507 @@
+version: "3"
+
+dotenv: [".env"]
+
+vars:
+  KIND_CLUSTER: konnect-observability-demo
+  TF_DIR: "{{.TASKFILE_DIR}}/terraform"
+  K8S_DIR: "{{.TASKFILE_DIR}}/k8s"
+  DECK_DIR: "{{.TASKFILE_DIR}}/deck"
+  NAMESPACE: kong
+  # 3 Control Planes, each in its own namespace - must match
+  # terraform/variables.tf's control_planes map keys, and each cpN needs a
+  # deck/kong-otel-cpN.yaml and a kong-cpN k8s namespace (created by
+  # k8s/manifests/shared/01-konnect-auth.yaml).
+  CPS: "cp1 cp2 cp3"
+
+tasks:
+
+  # ─── Top-level ────────────────────────────────────────────────────────────
+
+  preflight:
+    desc: "Check required CLI tools are installed (terraform, kind, kubectl, helm, deck, docker)"
+    cmds:
+      - "{{.TASKFILE_DIR}}/scripts/preflight.sh"
+
+  up:
+    desc: "Full setup: 3 Konnect CPs → kind cluster → MetalLB → Kong Operator → 3 DataPlanes → decK sync (all 3, OTel-only) → Datadog"
+    cmds:
+      - task: preflight
+      - task: tf:apply
+      - task: cluster:up
+      - task: metallb:install
+      - task: operator:install
+      - task: operator:wait
+      - task: operator:webhook:wait
+      - task: dp:up:all
+      - task: dp:wait:all
+      - task: deck:sync:all
+      - task: datadog:up
+      - task: status
+
+  down:
+    desc: "Tear down the kind cluster and destroy all 3 Konnect control planes"
+    cmds:
+      - kind delete cluster --name {{.KIND_CLUSTER}} || true
+      - task: tf:destroy
+
+  status:
+    desc: "Show status of all 3 CPs' CRDs/pods/services, and Datadog"
+    cmds:
+      - |
+        for cp in {{.CPS}}; do
+          echo "── $cp (namespace: kong-$cp) ──────────────────────────"
+          kubectl -n kong-$cp get konnectgatewaycontrolplane,konnectextension,dataplane,pods,svc --no-headers 2>/dev/null || echo "  (not deployed)"
+          echo ""
+        done
+        echo "── Datadog Agent ─────────────────────────────────────"
+        kubectl -n datadog get pods --no-headers 2>/dev/null || echo "  (not deployed)"
+        echo ""
+        echo "Proxy IPs (one per CP):"
+        for cp in {{.CPS}}; do
+          IP=$(kubectl -n kong-$cp get svc -o jsonpath='{.items[?(@.spec.type=="LoadBalancer")].status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+          echo "  $cp: ${IP:-<none yet>}"
+        done
+
+  # ─── Terraform (3 Konnect Control Planes) ────────────────────────────────
+
+  tf:init:
+    desc: "Initialize terraform"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform init
+
+  tf:apply:
+    desc: "Create all 3 Konnect control planes via terraform (see variables.tf's control_planes map)"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - task: tf:init
+      - terraform apply -auto-approve
+
+  tf:destroy:
+    desc: "Destroy all 3 Konnect control planes"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform destroy -auto-approve
+
+  tf:output:
+    desc: "Print all 3 control planes' IDs/names"
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform output
+
+  # ─── Kind cluster ─────────────────────────────────────────────────────────
+
+  cluster:up:
+    desc: "Create the local kind cluster and the shared Konnect PAT secret"
+    cmds:
+      - |
+        if kind get clusters 2>/dev/null | grep -q "^{{.KIND_CLUSTER}}$"; then
+          echo "→ Cluster '{{.KIND_CLUSTER}}' already exists, skipping"
+        else
+          kind create cluster --config "{{.K8S_DIR}}/kind-config.yaml"
+        fi
+      - task: cluster:secrets
+
+  cluster:secrets:
+    desc: "Create the kong namespace and konnect-api-auth-secret (shared by all 3 CPs, cross-namespace)"
+    internal: true
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        kubectl create secret generic konnect-api-auth-secret \
+          --namespace {{.NAMESPACE}} \
+          --from-literal=token="${KONNECT_PAT}" \
+          --dry-run=client -o yaml \
+          | kubectl label -f - --local -o yaml konghq.com/credential=konnect konghq.com/secret=true \
+          | kubectl apply -f -
+
+  cluster:down:
+    desc: "Delete the local kind cluster"
+    cmds:
+      - kind delete cluster --name {{.KIND_CLUSTER}}
+
+  # ─── MetalLB ──────────────────────────────────────────────────────────────
+
+  metallb:install:
+    desc: "Install MetalLB and configure an IPAddressPool from the kind Docker network"
+    cmds:
+      - helm repo add metallb https://metallb.github.io/metallb
+      - helm repo update
+      - |
+        helm upgrade --install metallb metallb/metallb \
+          --namespace metallb-system \
+          --create-namespace \
+          -f "{{.K8S_DIR}}/helm/metallb-values.yaml" \
+          --wait
+      - task: metallb:configure
+
+  metallb:configure:
+    desc: "Create MetalLB IPAddressPool/L2Advertisement from the kind Docker network subnet (51 IPs - enough for 3 DataPlanes)"
+    cmds:
+      - |
+        SUBNET=$(docker network inspect kind \
+          -f '{{`{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}`}}' \
+          | grep -v ':' | head -1)
+        PREFIX=$(echo "${SUBNET}" | cut -d. -f1-3)
+        RANGE="${PREFIX}.200-${PREFIX}.250"
+        echo "→ MetalLB address range: ${RANGE}"
+        sed "s|__METALLB_RANGE__|${RANGE}|" "{{.K8S_DIR}}/metallb/metallb-config.yaml" \
+          | kubectl apply -f -
+        echo "✓ MetalLB configured"
+
+  # ─── Kong Operator ────────────────────────────────────────────────────────
+
+  operator:install:
+    desc: "Install Kong Operator via Helm with Konnect support (self-signed webhook certs, no cert-manager needed)"
+    cmds:
+      - kubectl create namespace kong-system --dry-run=client -o yaml | kubectl apply -f -
+      - helm repo add kong https://charts.konghq.com
+      - helm repo update
+      - |
+        helm upgrade --install kong-operator kong/kong-operator -n kong-system \
+          --create-namespace \
+          --set image.tag=2.3 \
+          --set env.ENABLE_CONTROLLER_KONNECT=true
+
+  operator:wait:
+    desc: "Wait for Kong Operator deployment to become available"
+    cmds:
+      - kubectl -n kong-system wait --for=condition=Available=true --timeout=120s deployment/kong-operator-kong-operator-controller-manager
+
+  operator:webhook:wait:
+    desc: "Wait for Kong Operator admission webhook to be reachable (prevents secret creation failures)"
+    cmds:
+      - |
+        echo "→ Waiting for KGO webhook endpoints to be populated..."
+        for i in $(seq 1 40); do
+          READY=$(kubectl get endpoints -n kong-system \
+            kong-operator-kong-operator-webhook \
+            -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
+          if [ -n "$READY" ]; then
+            echo "✓ KGO webhook endpoint ready at ${READY}"
+            sleep 2
+            exit 0
+          fi
+          sleep 3
+        done
+        echo "✗ KGO webhook endpoint did not become ready in 120s"
+        exit 1
+
+  # ─── DataPlanes (Konnect CRDs, 3x - one per CP) ──────────────────────────
+
+  dp:up:shared:
+    desc: "Apply shared auth resources: kong-cp1/2/3 namespaces, the one real Secret's KonnectAPIAuthConfiguration, KongReferenceGrant, and each namespace's cross-namespace KonnectAPIAuthConfiguration"
+    cmds:
+      - |
+        sed "s|__KONNECT_SERVER_URL__|${KONNECT_SERVER_URL}|g" \
+          "{{.K8S_DIR}}/manifests/shared/01-konnect-auth.yaml" | kubectl apply -f -
+
+  dp:up:
+    desc: "Apply KonnectGatewayControlPlane (Mirror)/KonnectExtension/DataPlane for one CP. Usage: task dp:up CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        CP_ID=$(cd {{.TF_DIR}} && terraform output -json control_plane_ids | jq -r '.["{{.CP}}"]')
+        CP_NAME=$(cd {{.TF_DIR}} && terraform output -json control_plane_names | jq -r '.["{{.CP}}"]')
+
+        for f in {{.K8S_DIR}}/manifests/per-cp/*.yaml; do
+          sed \
+            -e "s|__CONTROL_PLANE_ID__|${CP_ID}|g" \
+            -e "s|__CONTROL_PLANE_NAME__|${CP_NAME}|g" \
+            -e "s|__CP_NAMESPACE__|kong-{{.CP}}|g" \
+            -e "s|__KONNECT_SERVER_URL__|${KONNECT_SERVER_URL}|g" \
+            -e "s|__DP_IMAGE__|${DP_IMAGE}|g" \
+            "$f" | kubectl apply -f -
+        done
+
+  dp:up:all:
+    desc: "Apply shared auth resources, then all 3 CPs' Control Plane/Extension/DataPlane"
+    cmds:
+      - task: dp:up:shared
+      - for: { var: CPS, split: " " }
+        task: dp:up
+        vars: { CP: "{{.ITEM}}" }
+
+  dp:wait:
+    desc: "Wait for one CP's DataPlane to become Ready. Usage: task dp:wait CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - kubectl -n kong-{{.CP}} wait --for=condition=Ready=true --timeout=120s dataplane/dataplane
+
+  dp:wait:all:
+    desc: "Wait for all 3 CPs' DataPlanes to become Ready"
+    cmds:
+      - for: { var: CPS, split: " " }
+        task: dp:wait
+        vars: { CP: "{{.ITEM}}" }
+
+  dp:status:
+    desc: "Show one CP's DataPlane status and proxy LoadBalancer IP. Usage: task dp:status CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - kubectl -n kong-{{.CP}} get konnectgatewaycontrolplane,konnectextension,dataplane,pods,svc
+
+  validate:auth:
+    desc: "Validate one CP's KonnectAPIAuthConfiguration is valid. Usage: task validate:auth CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - |
+        STATUS=$(kubectl get konnectapiauthconfiguration konnect-api-auth -n kong-{{.CP}} \
+          -o jsonpath="{.status.conditions[?(@.type=='APIAuthValid')].status}" 2>/dev/null)
+        if [ "$STATUS" = "True" ]; then
+          echo "✓ KonnectAPIAuthConfiguration is valid (kong-{{.CP}})"
+          kubectl get konnectapiauthconfiguration konnect-api-auth -n kong-{{.CP}}
+        else
+          echo "✗ KonnectAPIAuthConfiguration not valid in kong-{{.CP}} (status: ${STATUS:-unknown})"
+          exit 1
+        fi
+
+  validate:controlplane:
+    desc: "Validate one CP's KonnectGatewayControlPlane is Programmed. Usage: task validate:controlplane CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - |
+        CP_NAME=$(cd {{.TF_DIR}} && terraform output -json control_plane_names | jq -r '.["{{.CP}}"]')
+        STATUS=$(kubectl get -n kong-{{.CP}} konnectgatewaycontrolplane ${CP_NAME} \
+          -o jsonpath="{.status.conditions[?(@.type=='Programmed')].status}" 2>/dev/null)
+        if [ "$STATUS" = "True" ]; then
+          echo "✓ KonnectGatewayControlPlane '${CP_NAME}' is Programmed"
+        else
+          echo "✗ KonnectGatewayControlPlane not Programmed (status: ${STATUS:-unknown})"
+          exit 1
+        fi
+
+  demo:test:
+    desc: "Send test requests through one CP's proxy (open + key-auth-protected route). Usage: task demo:test CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - |
+        PROXY_IP=$(kubectl get service -n kong-{{.CP}} \
+          -o jsonpath='{.items[?(@.spec.type=="LoadBalancer")].status.loadBalancer.ingress[0].ip}')
+        if [ -z "$PROXY_IP" ]; then
+          echo "✗ No LoadBalancer IP yet for kong-{{.CP}} — is MetalLB running?"
+          exit 1
+        fi
+        echo "→ Proxy IP ({{.CP}}): ${PROXY_IP}"
+        echo ""
+        echo "→ GET /sample/get (open, no auth required)"
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${PROXY_IP}/sample/get")
+        echo "  HTTP ${HTTP_STATUS}"
+        echo ""
+        echo "→ GET /protected/get (key-auth, no key -> expect 401)"
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${PROXY_IP}/protected/get")
+        echo "  HTTP ${HTTP_STATUS}"
+        echo ""
+        echo "→ GET /protected/get with apikey: {{.CP}}-sample-api-key (expect 200)"
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: {{.CP}}-sample-api-key" "http://${PROXY_IP}/protected/get")
+        echo "  HTTP ${HTTP_STATUS}"
+
+  demo:test:all:
+    desc: "Send test requests through all 3 CPs (open + protected routes, 200s and 401s)"
+    cmds:
+      - for: { var: CPS, split: " " }
+        task: demo:test
+        vars: { CP: "{{.ITEM}}" }
+
+  # ─── decK (Service/Route/Plugins → Konnect, 3x - one per CP) ────────────────
+  #
+  # All 3 CPs run OTel-only (deck/kong-otel-cpN.yaml - single opentelemetry
+  # plugin for metrics, traces, AND access logs). deck/kong.yaml (OTel
+  # traces/logs + Prometheus metrics, side by side) is kept as a standalone
+  # single-CP comparison example - see README.md - not part of the 3-CP
+  # setup this Taskfile drives by default.
+
+  deck:sync:
+    desc: "Sync one CP's deck/kong-otel-<cp>.yaml to Konnect. Usage: task deck:sync CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - |
+        CP_NAME=$(cd {{.TF_DIR}} && terraform output -json control_plane_names | jq -r '.["{{.CP}}"]')
+        deck gateway sync \
+          --konnect-token "${KONNECT_PAT}" \
+          --konnect-addr "${KONNECT_SERVER_URL}" \
+          --konnect-control-plane-name "${CP_NAME}" \
+          "{{.DECK_DIR}}/kong-otel-{{.CP}}.yaml"
+
+  deck:diff:
+    desc: "Preview what decK would change for one CP without applying. Usage: task deck:diff CP=cp1"
+    requires:
+      vars: [CP]
+    cmds:
+      - |
+        CP_NAME=$(cd {{.TF_DIR}} && terraform output -json control_plane_names | jq -r '.["{{.CP}}"]')
+        deck gateway diff \
+          --konnect-token "${KONNECT_PAT}" \
+          --konnect-addr "${KONNECT_SERVER_URL}" \
+          --konnect-control-plane-name "${CP_NAME}" \
+          "{{.DECK_DIR}}/kong-otel-{{.CP}}.yaml"
+
+  deck:sync:all:
+    desc: "Sync all 3 CPs' decK configs to Konnect"
+    cmds:
+      - for: { var: CPS, split: " " }
+        task: deck:sync
+        vars: { CP: "{{.ITEM}}" }
+
+  deck:diff:all:
+    desc: "Preview decK changes for all 3 CPs without applying"
+    cmds:
+      - for: { var: CPS, split: " " }
+        task: deck:diff
+        vars: { CP: "{{.ITEM}}" }
+
+  # ─── Single-CP comparison example (deck/kong.yaml) ───────────────────────
+  # Standalone: NOT part of the 3-CP setup above. Demonstrates the
+  # OTel-traces/logs + Prometheus-metrics combo against a single CP you
+  # bring up separately - see README.md's "Prometheus config" section.
+
+  deck:sync:single-cp-example:
+    desc: "Sync deck/kong.yaml (OpenTelemetry traces/logs + Prometheus metrics) - single-CP comparison example, not part of the 3-CP setup"
+    cmds:
+      - |
+        deck gateway sync \
+          --konnect-token "${KONNECT_PAT}" \
+          --konnect-addr "${KONNECT_SERVER_URL}" \
+          --konnect-control-plane-name "${SINGLE_CP_NAME:?Set SINGLE_CP_NAME to the name of a standalone CP you've created separately}" \
+          "{{.DECK_DIR}}/kong.yaml"
+
+  # ─── Datadog ──────────────────────────────────────────────────────────────
+
+  datadog:up:
+    desc: "Deploy Datadog Agent (Helm) with OTLP receiver. Requires DD_API_KEY + DD_SITE in .env"
+    cmds:
+      - |
+        if [ -z "${DD_API_KEY:-}" ] || [ -z "${DD_SITE:-}" ]; then
+          echo "✗ DD_API_KEY and DD_SITE must be set in .env"
+          exit 1
+        fi
+        helm repo add datadog https://helm.datadoghq.com 2>/dev/null || true
+        helm repo update datadog
+        helm upgrade --install datadog-agent datadog/datadog \
+          --namespace datadog \
+          --create-namespace \
+          -f "{{.TASKFILE_DIR}}/datadog/datadog-values.yaml" \
+          --set datadog.apiKey="${DD_API_KEY}" \
+          --set datadog.site="${DD_SITE}" \
+          --wait --timeout 120s
+        echo "✓ Datadog Agent installed"
+
+  datadog:down:
+    desc: "Remove Datadog Agent from the cluster"
+    cmds:
+      - helm uninstall datadog-agent --namespace datadog --ignore-not-found
+      - kubectl delete namespace datadog --ignore-not-found
+      - echo "✓ Datadog Agent removed"
+
+  datadog:logs:
+    desc: "Tail Datadog Agent logs (check OTLP ingestion)"
+    cmds:
+      - |
+        kubectl -n datadog logs \
+          -l app.kubernetes.io/name=datadog-agent \
+          --container agent \
+          -f --tail=50
+
+  datadog:dashboard:
+    desc: "Import the Prometheus-plugin dashboard into Datadog via API (single-CP comparison example). Requires DD_API_KEY + DD_APP_KEY + DD_SITE in .env"
+    cmds:
+      - task: _datadog:dashboard:import
+        vars: { DASHBOARD_FILE: "dashboard-prometheus.json" }
+
+  datadog:dashboard:otel:
+    desc: "Import the OTel-plugin dashboard into Datadog via API. Requires DD_API_KEY + DD_APP_KEY + DD_SITE in .env"
+    cmds:
+      - task: _datadog:dashboard:import
+        vars: { DASHBOARD_FILE: "dashboard-otel.json" }
+
+  _datadog:dashboard:import:
+    internal: true
+    cmds:
+      - |
+        if [ -z "${DD_API_KEY:-}" ] || [ -z "${DD_APP_KEY:-}" ] || [ -z "${DD_SITE:-}" ]; then
+          echo "✗ DD_API_KEY, DD_APP_KEY, and DD_SITE must be set in .env"
+          echo "  DD_APP_KEY is separate from DD_API_KEY - create one at:"
+          echo "  Datadog → Organization Settings → Application Keys"
+          exit 1
+        fi
+        DASHBOARD_JSON="{{.TASKFILE_DIR}}/datadog/{{.DASHBOARD_FILE}}"
+        ID_DIR="{{.TASKFILE_DIR}}/datadog/.dashboard-ids"
+        ID_FILE="${ID_DIR}/{{.DASHBOARD_FILE}}.id"
+        mkdir -p "${ID_DIR}"
+
+        # Re-runs update the same dashboard in place instead of creating a
+        # duplicate each time - the Datadog API has no upsert, so this
+        # tracks the created ID locally (gitignored, .dashboard-ids/) and
+        # PUTs to it on subsequent imports if it still exists remotely.
+        EXISTING_ID=""
+        if [ -f "${ID_FILE}" ]; then
+          CANDIDATE_ID=$(cat "${ID_FILE}")
+          CHECK_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.${DD_SITE}/api/v1/dashboard/${CANDIDATE_ID}" \
+            -H "DD-API-KEY: ${DD_API_KEY}" \
+            -H "DD-APPLICATION-KEY: ${DD_APP_KEY}")
+          if [ "$CHECK_CODE" = "200" ]; then
+            EXISTING_ID="$CANDIDATE_ID"
+          fi
+        fi
+
+        if [ -n "$EXISTING_ID" ]; then
+          echo "→ Updating existing dashboard ${EXISTING_ID} from ${DASHBOARD_JSON}"
+          RESP=$(curl -s -w "\n%{http_code}" -X PUT \
+            "https://api.${DD_SITE}/api/v1/dashboard/${EXISTING_ID}" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${DD_API_KEY}" \
+            -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" \
+            -d @"${DASHBOARD_JSON}")
+        else
+          echo "→ Importing new dashboard from ${DASHBOARD_JSON}"
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.${DD_SITE}/api/v1/dashboard" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${DD_API_KEY}" \
+            -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" \
+            -d @"${DASHBOARD_JSON}")
+        fi
+        HTTP_CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | sed '$d')
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+          DASH_URL=$(echo "$BODY" | jq -r '.url // empty')
+          DASH_ID=$(echo "$BODY" | jq -r '.id // empty')
+          echo "$DASH_ID" > "${ID_FILE}"
+          echo "✓ Dashboard saved: ${DASH_ID}"
+          echo "  https://app.${DD_SITE}${DASH_URL}"
+        else
+          echo "✗ Failed (HTTP ${HTTP_CODE}):"
+          echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+          exit 1
+        fi
+
+  datadog:status:
+    desc: "Check Datadog Agent OTLP receiver status"
+    cmds:
+      - |
+        POD=$(kubectl -n datadog get pod \
+          -l app.kubernetes.io/name=datadog-agent \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "✗ Datadog Agent not running — run: task datadog:up"
+          exit 1
+        fi
+        echo "── Agent pod: $POD ────────────────────────────────"
+        STATUS=$(kubectl -n datadog exec "$POD" -c agent -- agent status 2>/dev/null)
+        echo "── OTLP receiver ──"
+        # "OTLP" appears on its own line between ==== separators, not at the
+        # start of the block - match the line itself, then print 5 lines after.
+        echo "$STATUS" | grep -A5 "^OTLP$" || echo "  (OTLP section not found — is the agent still starting up?)"
+        echo "── Cluster endpoint ──"
+        kubectl -n datadog get svc datadog-agent -o custom-columns="NAME:.metadata.name,CLUSTER-IP:.spec.clusterIP,PORTS:.spec.ports[*].port" 2>/dev/null

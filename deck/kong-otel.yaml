@@ -1,0 +1,94 @@
+# Declarative config synced to Konnect via decK (task deck:sync:otel) - not KIC,
+# not Gateway API CRDs. Konnect propagates this to the mirrored DataPlane
+# automatically over the existing CP-DP connection.
+#
+# OTel-only variant of deck/kong.yaml: same sample Service/Route/Upstream, but
+# metrics, traces, AND access logs are all sent through a single
+# opentelemetry plugin instead of running opentelemetry + prometheus side by
+# side. Point of this file is to compare the two approaches - see
+# ../docs/prometheus-vs-otel-metrics.md for the metric-by-metric comparison
+# and which config to actually hand a customer.
+#
+# Sample backend: a plain echo/httpbin passthrough, just enough traffic to
+# generate real spans, access logs, and metrics for the observability demo.
+_format_version: "3.0"
+
+services:
+  - name: kong-sample-service
+    # Routed through the Upstream below (instead of a raw url:) so Kong
+    # performs load-balancing + health checks against it - this is what
+    # makes kong.upstream.target.status (OTel) / kong_upstream_target_health
+    # (Prometheus) emit at all. Without an Upstream/Target pair, neither
+    # plugin produces an upstream-health metric (confirmed live on the
+    # Prometheus side; same mechanism applies to OTel's equivalent).
+    host: kong-sample-upstream
+    port: 443
+    protocol: https
+    path: /anything
+    routes:
+      - name: kong-sample-route
+        paths:
+          - /sample
+        strip_path: true
+
+upstreams:
+  - name: kong-sample-upstream
+    healthchecks:
+      active:
+        type: https
+        http_path: /anything
+        healthy:
+          interval: 5
+          successes: 1
+        unhealthy:
+          interval: 5
+          http_failures: 2
+    targets:
+      - target: httpbin.konghq.com:443
+
+plugins:
+  # Single global OpenTelemetry plugin - metrics, traces, AND access logs.
+  # This is the "one plugin instead of two" config being evaluated against
+  # deck/kong.yaml (opentelemetry for traces/logs + prometheus for metrics).
+  #
+  # Requires KONG_TRACING_INSTRUMENTATIONS=all on the DataPlane (set in
+  # ../k8s/manifests/04-dataplane.yaml) - without it, Kong produces no spans
+  # regardless of this plugin's config. Metrics and access logs do not
+  # depend on that setting.
+  #
+  # Datadog Agent OTLP endpoint (same receiver, different paths per signal):
+  #   http://datadog-agent.datadog.svc.cluster.local:4318/v1/{traces,logs,metrics}
+  #   The DataPlane here runs with normal pod networking (no hostNetwork), so
+  #   cluster DNS resolves this directly - no ClusterIP workaround needed.
+  - name: opentelemetry
+    config:
+      traces_endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/traces
+      # access_logs: request/response transactional logs (method, status,
+      # latency, route/service) - confirmed field shape (access_logs.endpoint,
+      # not a top-level access_logs_endpoint) against
+      # developer.konghq.com/plugins/opentelemetry/examples/custom-access-logs.
+      access_logs:
+        endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/logs
+      # metrics: config.metrics is a DISTINCT block from access_logs/traces -
+      # confirmed against developer.konghq.com/plugins/opentelemetry/reference.
+      # Each family has its own enable_* boolean, default false - metrics
+      # export produces NOTHING until endpoint is set AND the relevant flag
+      # is true. AI/MCP/A2A metrics (enable_ai_metrics) intentionally left
+      # off - this example has no AI Gateway plugins configured, so those
+      # metrics would never populate. Enable it if your services use AI
+      # Gateway plugins.
+      metrics:
+        endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/metrics
+        push_interval: 10
+        enable_request_metrics: true
+        enable_latency_metrics: true
+        enable_bandwidth_metrics: true
+        enable_upstream_health_metrics: true
+        enable_consumer_attribute: true
+      resource_attributes:
+        service.name: konnect-observability-demo-otel
+        env: demo
+      # 100% in this demo - tune down for any real production use.
+      sampling_rate: 1.0
+      batch_span_count: 200
+      batch_flush_delay: 3

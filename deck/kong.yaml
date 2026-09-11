@@ -1,0 +1,86 @@
+# Declarative config synced to Konnect via decK (task deck:sync) - not KIC,
+# not Gateway API CRDs. Konnect propagates this to the mirrored DataPlane
+# automatically over the existing CP-DP connection.
+#
+# Sample backend: a plain echo/httpbin passthrough, just enough traffic to
+# generate real spans, access logs, and metrics for the observability demo.
+_format_version: "3.0"
+
+services:
+  - name: kong-sample-service
+    # Routed through the Upstream below (instead of a raw url:) so Kong
+    # performs load-balancing + health checks against it - this is what
+    # makes the Prometheus plugin emit kong_upstream_target_health.
+    # Without an Upstream/Target pair, that metric is never produced,
+    # even with upstream_health_metrics: true set below (confirmed live -
+    # absent from :8100/metrics on the plain url: config this replaced).
+    host: kong-sample-upstream
+    port: 443
+    protocol: https
+    path: /anything
+    routes:
+      - name: kong-sample-route
+        paths:
+          - /sample
+        strip_path: true
+
+upstreams:
+  - name: kong-sample-upstream
+    healthchecks:
+      active:
+        type: https
+        http_path: /anything
+        healthy:
+          interval: 5
+          successes: 1
+        unhealthy:
+          interval: 5
+          http_failures: 2
+    targets:
+      - target: httpbin.konghq.com:443
+
+plugins:
+  # Global OpenTelemetry plugin - traces + access logs only. Metrics are
+  # NOT configured here; the Prometheus plugin below handles those instead.
+  # See deck/kong-otel.yaml for the alternative single-plugin (OTel-only,
+  # including metrics) approach this repo also demonstrates.
+  #
+  # Requires KONG_TRACING_INSTRUMENTATIONS=all on the DataPlane (set in
+  # ../k8s/manifests/04-dataplane.yaml) - without it, Kong produces no spans
+  # regardless of this plugin's config.
+  #
+  # Datadog Agent OTLP endpoint:
+  #   In-cluster (normal pod networking): http://datadog-agent.datadog.svc.cluster.local:4318
+  #   The DataPlane here runs with normal pod networking (no hostNetwork), so
+  #   cluster DNS resolves this directly - no ClusterIP workaround needed.
+  - name: opentelemetry
+    config:
+      traces_endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/traces
+      # access_logs: request/response transactional logs (method, status,
+      # latency, route/service) - confirmed field shape (access_logs.endpoint,
+      # not a top-level access_logs_endpoint) against
+      # developer.konghq.com/plugins/opentelemetry/examples/custom-access-logs.
+      access_logs:
+        endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/logs
+      resource_attributes:
+        service.name: konnect-observability-demo
+        env: demo
+      # 100% in this demo - tune down for any real production use.
+      sampling_rate: 1.0
+      batch_span_count: 200
+      batch_flush_delay: 3
+
+  # Global Prometheus plugin - exposes Kong's own metrics on the Status API
+  # (:8100/metrics) in Prometheus/OpenMetrics exposition format. This is a
+  # SCRAPE endpoint, not a push - unlike the OTel plugin above, nothing here
+  # sends data anywhere. The Datadog Agent's Prometheus/OpenMetrics check
+  # (configured via pod annotations on the DataPlane, see
+  # ../k8s/manifests/04-dataplane.yaml) scrapes this endpoint on an interval.
+  # Confirmed against developer.konghq.com/plugins/prometheus/reference -
+  # config is feature toggles only, no endpoint/target fields on this plugin.
+  - name: prometheus
+    config:
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: true
+      upstream_health_metrics: true

@@ -1,0 +1,98 @@
+# Declarative config for Control Plane 1 (cp1) - synced via `task deck:sync:cp1`.
+# Not KIC, not Gateway API CRDs. Konnect propagates this to the mirrored
+# DataPlane in the kong-cp1 namespace automatically over the existing CP-DP
+# connection.
+#
+# OTel-only: single opentelemetry plugin for metrics, traces, AND access
+# logs - see ../README.md for why this repo demonstrates that instead of
+# also running the Prometheus plugin (deck/kong.yaml's approach) across 3
+# Control Planes.
+#
+# 2 services here (one open, one key-auth-protected) so real traffic
+# produces both 200s and 401s - useful for testing error-rate panels
+# without relying on Kong-rejected/no-route-matched requests, which don't
+# reliably increment kong_http_requests_total / http.server.request.count
+# (confirmed live earlier in this repo's development, on the Prometheus
+# side - same underlying request-lifecycle mechanism likely applies here).
+_format_version: "3.0"
+
+services:
+  - name: kong-sample-service-cp1
+    host: kong-sample-upstream-cp1
+    port: 443
+    protocol: https
+    path: /anything
+    routes:
+      - name: kong-sample-route-cp1
+        paths:
+          - /sample
+        strip_path: true
+
+  - name: kong-protected-service-cp1
+    host: kong-sample-upstream-cp1
+    port: 443
+    protocol: https
+    path: /anything
+    routes:
+      - name: kong-protected-route-cp1
+        paths:
+          - /protected
+        strip_path: true
+
+upstreams:
+  - name: kong-sample-upstream-cp1
+    healthchecks:
+      active:
+        type: https
+        http_path: /anything
+        healthy:
+          interval: 5
+          successes: 1
+        unhealthy:
+          interval: 5
+          http_failures: 2
+    targets:
+      - target: httpbin.konghq.com:443
+
+consumers:
+  - username: cp1-sample-consumer
+    keyauth_credentials:
+      - key: cp1-sample-api-key
+
+plugins:
+  # key-auth scoped to the protected service only - the open service has
+  # no auth plugin, so it always returns 200 (routing succeeds). The
+  # protected service returns 401 for any request missing a valid apikey
+  # header/query param - confirmed schema (key_names, service: scoping)
+  # against developer.konghq.com/plugins/key-auth/reference.
+  - name: key-auth
+    service: kong-protected-service-cp1
+    config:
+      key_names:
+        - apikey
+
+  - name: opentelemetry
+    config:
+      traces_endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/traces
+      access_logs:
+        endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/logs
+      metrics:
+        endpoint: http://datadog-agent.datadog.svc.cluster.local:4318/v1/metrics
+        push_interval: 10
+        enable_request_metrics: true
+        enable_latency_metrics: true
+        enable_bandwidth_metrics: true
+        enable_upstream_health_metrics: true
+        enable_consumer_attribute: true
+      # Mirrors this CP's Terraform labels (terraform/variables.tf,
+      # control_planes.cp1) - Konnect and Datadog should never disagree
+      # about this CP's env/team/region. See datadog/datadog-values.yaml
+      # for why these live here and NOT as Datadog Agent-global tags.
+      resource_attributes:
+        service.name: konnect-observability-demo-cp1
+        env: prod
+        team: checkout
+        region: eu-west-1
+      sampling_rate: 1.0
+      batch_span_count: 200
+      batch_flush_delay: 3

@@ -1,0 +1,21 @@
+# KonnectExtension binds the DataPlane below to the mirrored control plane above.
+# provisioning: Automatic - Kong Operator generates and rotates the DP client
+# cert itself, per
+# https://developer.konghq.com/operator/get-started/konnect-crds/controlplane/
+# ("Bind the control plane using a KonnectExtension"). No cert-manager, no
+# custom CA - the simplest path, appropriate for this demo repo.
+apiVersion: konnect.konghq.com/v1alpha2
+kind: KonnectExtension
+metadata:
+  name: __CONTROL_PLANE_NAME__
+  namespace: __CP_NAMESPACE__
+spec:
+  clientAuth:
+    certificateSecret:
+      provisioning: Automatic
+  konnect:
+    controlPlane:
+      ref:
+        type: konnectNamespacedRef
+        konnectNamespacedRef:
+          name: __CONTROL_PLANE_NAME__

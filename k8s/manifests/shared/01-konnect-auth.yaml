@@ -1,0 +1,116 @@
+# Konnect auth for a 3-Control-Plane, per-CP-namespace setup.
+#
+# The actual PAT lives in ONE Secret, in the "kong" namespace (created by
+# Taskfile's cluster:secrets task from $KONNECT_PAT in .env) - not
+# duplicated per CP. Each CP's own namespace (kong-cp1/cp2/cp3) gets its
+# own KonnectAPIAuthConfiguration that references this Secret
+# CROSS-NAMESPACE via spec.secretRef.namespace (a real v2.3+ Kong
+# Operator feature - confirmed against
+# developer.konghq.com/operator/konnect/cross-namespace-references).
+#
+# This is required because KonnectGatewayControlPlane must be in the SAME
+# namespace as the KonnectAPIAuthConfiguration it references (confirmed
+# against developer.konghq.com/operator/get-started/konnect-crds/controlplane
+# - "Make sure that the KonnectGatewayControlPlane resource is in the same
+# namespace as the KonnectAPIAuthConfiguration resource") - so with 3
+# per-CP namespaces, each namespace needs its own auth config object, even
+# though they all point at the one real Secret.
+#
+# The KongReferenceGrant below uses group: core (the literal string, not
+# an empty string) for the Secret target - confirmed via
+# `kubectl explain kongreferencegrant.spec.to`, this CRD's group field is
+# `minLength: 1`, so an empty string is rejected at admission time despite
+# what the standard Gateway API ReferenceGrant convention would suggest.
+# Confirmed against two real examples in Kong's own docs
+# (developer.konghq.com/operator/konnect/cross-namespace-references and
+# .../operator/konnect/how-to/secret-cross-namespace-reference), both of
+# which use "core" literally.
+#
+# The Secret's own namespace's auth config (kong namespace) - kept for any
+# cluster-scoped or kong-namespace-local resources that might need it.
+apiVersion: konnect.konghq.com/v1alpha1
+kind: KonnectAPIAuthConfiguration
+metadata:
+  name: konnect-api-auth
+  namespace: kong
+spec:
+  type: secretRef
+  secretRef:
+    name: konnect-api-auth-secret
+  serverURL: __KONNECT_SERVER_URL__
+---
+# Grants kong-cp1/cp2/cp3's KonnectAPIAuthConfiguration objects permission
+# to reference the Secret living in the "kong" namespace. Lives in the
+# Secret's own namespace (the target), per Kong's cross-namespace-references
+# doc.
+apiVersion: configuration.konghq.com/v1alpha1
+kind: KongReferenceGrant
+metadata:
+  name: allow-per-cp-auth-to-secret
+  namespace: kong
+spec:
+  from:
+    - group: konnect.konghq.com
+      kind: KonnectAPIAuthConfiguration
+      namespace: kong-cp1
+    - group: konnect.konghq.com
+      kind: KonnectAPIAuthConfiguration
+      namespace: kong-cp2
+    - group: konnect.konghq.com
+      kind: KonnectAPIAuthConfiguration
+      namespace: kong-cp3
+  to:
+    - group: core
+      kind: Secret
+      name: konnect-api-auth-secret
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kong-cp1
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kong-cp2
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kong-cp3
+---
+apiVersion: konnect.konghq.com/v1alpha1
+kind: KonnectAPIAuthConfiguration
+metadata:
+  name: konnect-api-auth
+  namespace: kong-cp1
+spec:
+  type: secretRef
+  secretRef:
+    name: konnect-api-auth-secret
+    namespace: kong
+  serverURL: __KONNECT_SERVER_URL__
+---
+apiVersion: konnect.konghq.com/v1alpha1
+kind: KonnectAPIAuthConfiguration
+metadata:
+  name: konnect-api-auth
+  namespace: kong-cp2
+spec:
+  type: secretRef
+  secretRef:
+    name: konnect-api-auth-secret
+    namespace: kong
+  serverURL: __KONNECT_SERVER_URL__
+---
+apiVersion: konnect.konghq.com/v1alpha1
+kind: KonnectAPIAuthConfiguration
+metadata:
+  name: konnect-api-auth
+  namespace: kong-cp3
+spec:
+  type: secretRef
+  secretRef:
+    name: konnect-api-auth-secret
+    namespace: kong
+  serverURL: __KONNECT_SERVER_URL__
